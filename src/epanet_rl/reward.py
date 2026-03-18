@@ -8,7 +8,7 @@ Implemented rules:
 3) At t == 23, if final tank volume < initial tank volume:
    total reward = regular reward + P_tank
 4) P_tank supports two modes:
-   - proportional: coefficient * (initial - final)
+   - proportional: C_tank * ((initial - final) / initial) * r_benchmark
    - constant: fixed value
 
 All functions are pure and side-effect free.
@@ -70,20 +70,28 @@ def compute_regular_reward(r_benchmark: float, e_pump_t: float, horizon_steps: i
 def compute_tank_penalty(
     initial_tank_volume: float,
     final_tank_volume: float,
+    r_benchmark: float,
     config: TankPenaltyConfig,
 ) -> float:
     """Compute P_tank when final tank volume is below initial volume.
 
     Returns 0.0 when final_tank_volume >= initial_tank_volume.
+    In proportional mode, returns:
+        C_tank * ((initial - final) / initial) * r_benchmark
+    with safety guard for initial_tank_volume <= 0.
     """
 
     if final_tank_volume >= initial_tank_volume:
         return 0.0
 
-    shortfall = initial_tank_volume - final_tank_volume
     if config.mode == "constant":
         return config.constant_value
-    return config.proportional_coefficient * shortfall
+
+    if initial_tank_volume <= 0.0:
+        return 0.0
+
+    shortfall_ratio = (initial_tank_volume - final_tank_volume) / initial_tank_volume
+    return config.proportional_coefficient * shortfall_ratio * r_benchmark
 
 
 def compute_total_reward(
@@ -121,6 +129,7 @@ def compute_total_reward(
         tank_penalty = compute_tank_penalty(
             initial_tank_volume=step.initial_tank_volume,
             final_tank_volume=step.final_tank_volume,
+            r_benchmark=step.r_benchmark,
             config=tank_penalty_config,
         )
 
