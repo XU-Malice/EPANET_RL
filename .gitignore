@@ -32,3 +32,13 @@ coverage.xml
 # OS files
 .DS_Store
 Thumbs.db
+
+*.bin
+*.rpt
+temp.inp
+temp.rpt
+temp.bin
+rollout_check.py
+wntr_rollout_check.py
+networks/Net3_modified.inp
+networks/Net3_modified_backup.inp
