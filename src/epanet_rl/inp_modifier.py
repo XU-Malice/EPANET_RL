@@ -33,7 +33,15 @@ _DEMAND_CHARGE_RE = re.compile(r"^\s*Demand\s+Charge\b", re.IGNORECASE)
 
 
 def _find_section_bounds(lines: list[str], section_name: str) -> tuple[int, int]:
-    """定位某个 INP section 的起止行（包含头，不包含下一个 section 头）。"""
+    """定位某个 INP section 的起止行（包含头，不包含下一个 section 头）。
+
+    输入：INP 文本行列表、section 名称。
+    输出：`(start, end)` 索引对。
+
+    为什么这样设计：
+    - 当前仓库实现采用“文本级修改”而不是通过更重的解析/重写器；
+    - 只要 section 边界找准，后面的删除、插入、重写都会更可靠、更容易做 diff。
+    """
 
     target = section_name.strip().upper()
     for idx, line in enumerate(lines):
@@ -97,7 +105,13 @@ def _is_related_control_line(line: str) -> bool:
 
 
 def _remove_related_controls(lines: list[str]) -> list[str]:
-    """删除与 Link/Pump/Pipe 10/330/335 相关控制条目。"""
+    """删除与 Link/Pump/Pipe 10/330/335 相关控制条目。
+
+    论文/实现口径提示：
+    - 论文明确给出的：Net3 需要去掉部分原始控制逻辑，让 RL 直接接管泵调度；
+    - 当前仓库实现：按关键对象编号在 `CONTROLS` 和 `RULES` 中做文本过滤；
+    - 工程近似：使用正则匹配相关行，而不是构建完整语法树。
+    """
 
     for section_name in ("CONTROLS", "RULES"):
         bounds = _try_find_section_bounds(lines, section_name)
@@ -111,7 +125,12 @@ def _remove_related_controls(lines: list[str]) -> list[str]:
 
 
 def _set_pipe_330_closed(lines: list[str]) -> list[str]:
-    """在 [STATUS] 中确保 Pipe 330 为 Closed（且只保留一条）。"""
+    """在 [STATUS] 中确保 Pipe 330 为 Closed（且只保留一条）。
+
+    为什么这样设计：
+    - 论文明确给出的：需要固定某些原网络元件状态；
+    - 当前仓库实现：无论原文件是否已有多条 330 记录，最终都规整成唯一一条 `Closed`。
+    """
 
     section_start, section_end = _find_section_bounds(lines, "STATUS")
     body = lines[section_start + 1 : section_end]
@@ -177,6 +196,7 @@ def _set_energy_section(lines: list[str]) -> list[str]:
         preserved_lines.append(line)
 
     # EPANET [ENERGY] 的 Global Efficiency 使用百分数（75 表示 0.75）。
+    # 教学提示：这里最容易误读。代码内部常用 0.75 表示效率，但写回 INP 时必须变成 75。
     efficiency_percent = TARGET_PUMP_EFFICIENCY * 100.0
     energy_settings = [
         f" Global Efficiency\t{_format_number(efficiency_percent)}",
@@ -200,7 +220,15 @@ def _set_energy_section(lines: list[str]) -> list[str]:
 
 
 def _build_tou_pattern_values() -> list[str]:
-    """构造 24 小时 TOU 电价乘子。"""
+    """构造 24 小时 TOU 电价乘子。
+
+    输出：长度 24 的字符串列表，每个元素对应一个小时的相对电价倍数。
+
+    论文/实现口径提示：
+    - 论文明确给出的：需要峰谷电价设定；
+    - 当前仓库实现：07:00-23:00 视为峰段，其余为谷段；
+    - 若你怀疑论文原文具体时段定义不同，请查论文/附录，不要把本仓库实现直接当作论文原句。
+    """
 
     peak_ratio = PEAK_PRICE_USD_PER_KWH / OFFPEAK_PRICE_USD_PER_KWH
     values = []
@@ -250,10 +278,23 @@ def _upsert_tou_pattern(lines: list[str]) -> list[str]:
 def modify_inp_text(inp_text: str) -> str:
     """将原始 INP 文本转换为 RL 预处理后的文本。
 
+    输入：原始 INP 文件全文字符串。
+    输出：修改后的 INP 全文字符串。
+
     说明：
     - 这是纯文本函数，不做磁盘 I/O；
     - 适合在单测中直接做“输入文本 -> 输出文本”的断言；
     - 环境初始化时也可以先在内存完成改写，再写入临时 INP 文件。
+
+    修改顺序：
+    1. 删除相关 controls/rules；
+    2. 固定 Pipe330 状态；
+    3. 重写 ENERGY；
+    4. 插入/更新 TOU pattern。
+
+    为什么要固定顺序：
+    - 这样每次生成的文本 diff 更稳定；
+    - 出现问题时更容易判断是哪一步改坏了。
     """
 
     newline = "\r\n" if "\r\n" in inp_text else "\n"

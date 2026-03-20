@@ -33,7 +33,14 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class ZScoreStats:
-    """Z-Score 统计结果结构。"""
+    """Z-Score 统计结果结构。
+
+    这是一个“可直接落盘为 JSON”的结果对象。
+
+    为什么 demand/tank 要分开保存：
+    - 论文状态向量虽最终会拼接，但两部分物理量量纲不同；
+    - 分开统计更利于你检查到底是哪一段状态分布异常。
+    """
 
     episode_count: int
     state_sample_count: int
@@ -177,7 +184,15 @@ def _append_state_sample(
     demand_stats: _RunningFeatureStats,
     tank_stats: _RunningFeatureStats,
 ) -> None:
-    """将单个观测拆成 demand/tank 两段后写入在线统计器。"""
+    """将单个观测拆成 demand/tank 两段后写入在线统计器。
+
+    输入：未缩放观测 `obs`，以及 demand 维度切分点。
+    输出：无；副作用是更新两个在线统计器。
+
+    为什么这样设计：
+    - 当前仓库实现把 observation 定义为 `[demand..., tank...]` 拼接；
+    - 因此只要知道 demand 维度，就能稳定切开两部分。
+    """
 
     obs64 = obs.astype("float64", copy=False)
     demand_stats.update_batch(obs64[:demand_dim].reshape(1, -1))
@@ -239,6 +254,7 @@ def main() -> None:
         ) from exc
 
     # 随机动作策略的 RNG；与环境 reset seed 共同决定可复现实验轨迹。
+    # 教学提示：这和“训练时策略网络采样”不是一回事，这里只是为了收集状态分布样本。
     policy_rng = np.random.default_rng(args.seed)
     episode_lengths: list[int] = []
     violation_count = 0

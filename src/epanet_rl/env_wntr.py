@@ -51,6 +51,13 @@ ScalingMode = Literal["none", "max_min", "z_score"]
 
 @dataclass(frozen=True)
 class _Net3Meta:
+    """从 Net3/修改版 INP 中提取出的静态元数据。
+
+    这些字段在一个训练 run 内通常视为“网络常量”：
+    - junction/tank/pump 名称用于建立稳定索引；
+    - demand/tank 几何参数用于 reset、obs 构造与奖励结算；
+    - 之所以集中到 dataclass，是为了把“网络结构信息”和“episode 运行态”清晰分开。
+    """
     junction_names: tuple[str, ...]
     base_demands: NDArray[np.float64]
     default_pattern: NDArray[np.float64]
@@ -126,6 +133,9 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
         if tank_level_epsilon < 0.0:
             raise ValueError(f"tank_level_epsilon must be >= 0, got {tank_level_epsilon}.")
 
+        # 下面这些参数大多直接对应“论文主线设定”或“当前仓库的工程开关”。
+        # 设计上统一在构造函数保存，原因是：训练脚本、评估脚本、诊断脚本都需要显式记录它们，
+        # 这样实验日志才能回答“这次 run 到底用了哪套环境口径”。
         self.net3_inp_path = Path(net3_inp_path)
         self.delta_time = float(delta_time)
         self.delta_space = float(delta_space)
@@ -144,6 +154,10 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
         self.demand_std_space = demand_std_space
 
         # 不直接改原始 Net3.inp：先生成临时“修改版 INP”供仿真使用。
+        # 这样做的原因：
+        # 1) 保持原始网络文件可追溯；
+        # 2) 训练期间每次实例化环境都能得到同样的实验底座；
+        # 3) 若你要核查论文复现差异，只需比较修改前后 INP diff。
         self._tmp_dir = Path(tempfile.mkdtemp(prefix="epanet_rl_wntr_"))
         self._modified_inp_path = self._tmp_dir / "net3_modified_for_wntr.inp"
         self._prepare_modified_inp()
@@ -219,7 +233,8 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
         self._time_multipliers = time_mul
         self._space_multipliers = space_mul
 
-        # 论文语义：初始 tank level 在 [min, max] 内均匀随机。
+        # 论文明确给出的：初始 tank level 在 [min, max] 内均匀随机。
+        # 教学理解：这一步决定了 episode 的“初始库存”，会直接影响后续 24 小时调度难度。
         self._tank_levels = self._rng.uniform(low=self._tank_min_levels, high=self._tank_max_levels)
         self._initial_tank_volume = self._compute_total_tank_volume(self._tank_levels)
 
@@ -247,6 +262,8 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
         if not self.action_space.contains(action):
             raise ValueError(f"Invalid action {action}. Must be in [0, {ACTION_COUNT - 1}].")
 
+        # 输入：离散动作编号。这里先保留 `original_action`，因为后续可能因 fallback 改成别的实际执行动作。
+        # 这样日志里能同时看到“agent 想做什么”和“环境最后执行了什么”。
         original_action = int(action)
         current_demands = self._current_demands[self._step_index]
         commanded_pump_speeds = action_id_to_speeds(original_action)
@@ -259,6 +276,9 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
         sim_failure_caught = False
 
         try:
+            # 主路径：按 agent 给出的动作做 1 小时真实仿真。
+            # 若出现 NaN/异常，当前仓库实现可选地退回到 (0, 0) 速度动作。
+            # 这是工程近似，不是论文明确逐句写出的策略，因此日志里要保留 `fallback_used`。
             sim_output = self._simulate_single_step(
                 executed_pump_speeds,
                 current_demands,
@@ -385,6 +405,10 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
                 pump_heads = np.full(2, np.nan, dtype=np.float64)
 
         # reward 与终止语义完全交给 reward.py，环境这里只负责提供输入。
+        # 这样做的教学价值很高：
+        # - 你可以把环境理解成“物理仿真器 + 状态机”；
+        # - 把奖励理解成“独立结算器”；
+        # 两者边界清楚后，复现实验时更容易逐层排错。
         reward_result = compute_total_reward(
             StepRewardInput(
                 t=self._step_index,
@@ -474,6 +498,10 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
         - 若有诊断逻辑，还会附带 energy/pressure 相关诊断字段。
         """
 
+        # 这里每个 step 都重新从“修改版 INP”构建 WNTR 网络，然后灌入本步状态。
+        # 当前仓库实现选择这种方式，是为了让单步仿真边界非常清晰：
+        # 输入就是“本小时 demand + 起始 tank level + 泵速度”，输出就是“1 小时后的结果”。
+        # 代价是仿真开销更高，但更利于论文复现审计。
         wn = wntr.network.WaterNetworkModel(str(self._modified_inp_path))
         self._configure_one_hour_options(wn)
         self._apply_tank_initial_levels(wn, tank_init_levels)
