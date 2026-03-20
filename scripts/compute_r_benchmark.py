@@ -35,7 +35,18 @@ ScalingMode = Literal["none", "max_min", "z_score"]
 
 @dataclass(frozen=True)
 class EpisodeRecord:
-    """单个 episode 的最小记录单元。"""
+    """单个 episode 的最小记录单元。
+
+    输出字段全部是“后处理统计真正需要的最小闭包”：
+    - 总能耗成本；
+    - 实际走了多少步；
+    - 是否出现水力违例；
+    - 是否触发 fallback。
+
+    为什么不把完整 step 日志都存下来：
+    - benchmark 脚本的目标是统计口径，不是做逐步诊断；
+    - 只保留聚合字段可以降低内存占用并简化 JSON 输出。
+    """
 
     total_energy_cost: float
     episode_length: int
@@ -159,7 +170,15 @@ def _run_single_episode(
     reset_seed: int | None,
     policy_rng: "np.random.Generator",
 ) -> EpisodeRecord:
-    """滚动一个 episode，并累计能耗/长度/约束标记。"""
+    """滚动一个 episode，并累计能耗/长度/约束标记。
+
+    输入：一个已构造好的环境、reset seed，以及用于随机策略采样动作的 RNG。
+    输出：`EpisodeRecord`。
+
+    教学理解：
+    - 这里的策略不是训练好的策略，而是“随机离散动作”；
+    - 因此算出来的 benchmark 更像“随机基准线”，用于给 `r_benchmark` 选一个可解释的参考值。
+    """
 
     _, _ = env.reset(seed=reset_seed)
 
@@ -248,6 +267,8 @@ def _compute_stats(records: list[EpisodeRecord]) -> BenchmarkStats:
         return float(np.std(values))
 
     # candidate benchmark 本质是不同口径下的均值能耗，便于和论文值对齐比较。
+    # 若你在论文复现报告里引用某个值，请一定写明使用的是哪一种口径，
+    # 因为“all / successful / full_horizon / non_fallback”并不完全等价。
     mean_total_energy_cost = float(np.mean(costs))
     successful_mean_total_energy_cost = _safe_mean(successful_costs)
     full_horizon_mean_total_energy_cost = _safe_mean(full_horizon_costs)

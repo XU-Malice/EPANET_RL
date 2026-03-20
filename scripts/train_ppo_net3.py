@@ -10,6 +10,16 @@
    - 训练过程同时保留 SB3 日志与脚本级 JSON 审计产物。
 3. 工程可运行增强：
    - 双模式进度反馈：TTY 使用 tqdm，日志重定向时输出静态 `[progress]` 行。
+
+从教学角度看，这个脚本主要回答三件事：
+1. 如何把 `Net3WntrEnv` 包装成 Stable-Baselines3 可训练对象；
+2. 如何把论文/实验超参数显式落到命令行与配置文件；
+3. 如何把训练产物（模型、日志、配置、摘要）组织成可审计目录。
+
+论文/实现口径提示：
+- 论文明确给出的：需要在 Net3 上训练策略，并比较 PPO / E-PPO 风格方法；
+- 当前仓库实现：基于 Stable-Baselines3 的 PPO 作为训练主干；
+- 工程近似：E-PPO 相关差异通过当前脚本中的参数映射实现，而不是论文作者原始训练代码逐行复刻。
 """
 
 from __future__ import annotations
@@ -62,6 +72,15 @@ class TrainSummary:
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    """构造训练脚本命令行参数。
+
+    输入：无。
+    输出：`argparse.ArgumentParser`。
+
+    为什么这样设计：
+    - 训练复现实验最怕“参数藏在代码里”；
+    - 把关键超参数全部暴露到 CLI，才能让一次 run 的配置被完整记录。
+    """
     parser = argparse.ArgumentParser(
         description="Train paper-oriented PPO / E-PPO on Net3WntrEnv."
     )
@@ -203,7 +222,14 @@ def _set_global_seeds(seed: int) -> None:
 
 
 def main() -> None:
-    """训练主流程入口。
+    """训练脚本主入口。
+
+    主流程可以按“实验流水线”来理解：
+    1. 解析参数；
+    2. 构造输出目录；
+    3. 创建环境与模型；
+    4. 执行训练；
+    5. 保存模型、摘要和配置。
 
     设计重点：
     - 先做参数校验，再构建环境与模型；
@@ -599,6 +625,7 @@ def main() -> None:
 
     def _make_env():
         # 训练入口固定使用主线环境 Net3WntrEnv。
+        # 教学理解：这里把“环境构造细节”收拢到闭包里，是为了交给 VecEnv/Monitor 统一管理。
         env = Net3WntrEnv(
             net3_inp_path=args.net3_inp,
             delta_time=float(args.delta_time),
@@ -616,9 +643,13 @@ def main() -> None:
         env.reset(seed=int(args.seed))
         return Monitor(env)
 
+    # 当前仓库实现使用 SB3 的向量环境包装，即使这里只有 1 个环境实例，
+    # 也能复用统一的训练接口、monitor 日志与后续扩展能力。
     vec_env = DummyVecEnv([_make_env])
     vec_env = VecMonitor(venv=vec_env, filename=str(monitor_csv))
 
+    # 这里是把“论文/实验超参数”映射到 SB3 PPO 构造函数的关键位置。
+    # 如果你要核查某个论文设定是否真的落地，优先看这里和输出的 train_config.json。
     model = PaperLikePPO(
         policy=PaperLikeActorCriticPolicy,
         env=vec_env,

@@ -20,7 +20,12 @@ from numpy.typing import ArrayLike, NDArray
 
 
 def _validate_delta(delta: float, name: str) -> None:
-    """统一校验 delta 边界，保证乘子保持正值。"""
+    """统一校验 delta 边界，保证乘子保持正值。
+
+    为什么强调 `< 1`：
+    - 若 `delta>=1`，则截断区间会触及 0 甚至负值；
+    - 对需水乘子而言，这会产生非物理含义，因此当前仓库直接拒绝。
+    """
 
     if delta < 0:
         raise ValueError(f"{name} must be >= 0, got {delta}.")
@@ -47,6 +52,20 @@ def sample_truncated_normal(
     max_rounds: int = 100,
 ) -> NDArray[np.float64]:
     """在 [mean-delta, mean+delta] 上采样截断正态。
+
+    输入：
+    - `size`：输出形状；
+    - `delta`：截断半径，区间为 `[mean-delta, mean+delta]`；
+    - `rng`：显式随机数生成器，用于复现实验；
+    - `mean/std`：截断正态分布参数。
+
+    输出：
+    - 指定形状的 `float64` 数组。
+
+    论文/实现口径提示：
+    - 论文明确给出的：时间和空间乘子来自截断正态，并限制在 `(1-Δ, 1+Δ)`；
+    - 当前仓库实现：通过 rejection sampling 近似这个采样过程；
+    - 工程近似：超过 `max_rounds` 后改用 clip 补齐，优先保证函数稳定返回。
 
     采样方法：
     - 先做 rejection sampling；
@@ -111,7 +130,15 @@ def generate_time_multipliers(
     rng: np.random.Generator,
     std_time: float | None = None,
 ) -> NDArray[np.float64]:
-    """生成按时间步变化的随机乘子。"""
+    """生成按时间步变化的随机乘子。
+
+    输入：episode 步数 `num_steps`、时间扰动幅度 `delta_time`、随机源 `rng`。
+    输出：长度为 `num_steps` 的时间乘子向量。
+
+    为什么这样设计：
+    - 时间乘子描述“同一天内每个小时整体高/低于默认模式多少”；
+    - 它与空间乘子分离，便于理解论文中的两阶段随机化。
+    """
 
     if num_steps < 0:
         raise ValueError(f"num_steps must be >= 0, got {num_steps}.")
@@ -134,6 +161,18 @@ def generate_space_multipliers(
     randomizable_mask: ArrayLike | None = None,
 ) -> NDArray[np.float64]:
     """生成按节点变化的随机乘子（支持固定节点）。
+
+    输入：
+    - `num_nodes`：节点数量；
+    - `delta_space`：空间扰动幅度；
+    - `randomizable_mask`：哪些节点允许随机。
+
+    输出：
+    - 长度为 `num_nodes` 的空间乘子向量。
+
+    为什么这样设计：
+    - 有些复现实验会要求部分节点保持原样；
+    - 通过 mask 可把“论文随机化主线”和“工程上固定部分节点”的需求兼容起来。
 
     `randomizable_mask` 语义：
     - True：该节点参与随机化
@@ -222,10 +261,16 @@ def generate_randomized_demands(
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
     """环境侧常用的一站式随机化接口。
 
-    返回三元组：
-    - randomized_demands: `(T, N)`
+    输入：基础需水、默认模式、时间/空间扰动幅度，以及随机源。
+
+    输出三元组：
+    - randomized_demands: `(T, N)`，环境真正使用的逐小时逐节点需水矩阵；
     - time_multipliers: `(T,)`
-    - space_multipliers: `(N,)`
+    - space_multipliers: `(N,)`，用于解释“哪些节点整体偏高/偏低”。
+
+    教学理解：
+    - 如果你想审计一次 `reset()` 到底随机了什么，就优先看这个函数的三个返回值；
+    - 它把“论文中的需求随机化公式”压缩成一条可复用接口。
     """
 
     base = np.asarray(base_demands, dtype=np.float64).reshape(-1)

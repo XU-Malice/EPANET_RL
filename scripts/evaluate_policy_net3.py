@@ -8,6 +8,17 @@
    - 增加奖励分解与 tank 末端体积审计字段，便于分析“省电但透支储水”现象。
 3. 工程近似说明：
    - 评估脚本负责“观测与统计”，不改变环境或训练逻辑。
+
+这个脚本的定位不是训练，而是“审计一个已经保存的策略”。
+
+教学理解：
+- 训练脚本回答“怎么学”；
+- 评估脚本回答“学出来以后到底表现怎样”；
+- 如果你在论文复现中要汇报最终指标，应优先引用这里产出的聚合统计。
+
+口径提示：
+- 论文明确给出的：需要看 reward、能耗、约束满足情况；
+- 当前仓库实现：额外记录 tank volume 变化、full horizon 比例等工程审计指标。
 """
 
 from __future__ import annotations
@@ -36,7 +47,11 @@ ScalingMode = Literal["none", "max_min", "z_score"]
 
 @dataclass(frozen=True)
 class EpisodeEvalRecord:
-    """单个 episode 的评估记录。"""
+    """单个 episode 的评估记录。
+
+    这里保留的是“最终报告最常用”的聚合指标，而不是逐 step 全日志。
+    如果你要进一步定位某次 episode 为何失败，应改用诊断脚本而不是继续堆字段到这里。
+    """
 
     total_reward: float
     total_energy_cost: float
@@ -199,10 +214,17 @@ def _run_single_episode(
 ) -> EpisodeEvalRecord:
     """执行一个 episode，并返回审计版记录。
 
+    输入：环境、模型、reset seed。
+    输出：单个 episode 的聚合评估记录。
+
     审计重点：
     - `total_reward` 与 `total_energy_cost` 同时保留，避免只看单一指标；
     - 同步记录 `base_reward/tank_penalty` 分解；
     - 记录初末 tank volume 与变化比例，辅助解释策略行为。
+
+    为什么采用“聚合后返回”：
+    - 评估阶段重点通常是最终均值/方差/成功率；
+    - 逐步日志太大，不适合默认写入评估 JSON。
     """
 
     obs, _ = env.reset(seed=reset_seed)
