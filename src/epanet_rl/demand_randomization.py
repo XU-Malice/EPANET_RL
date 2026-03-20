@@ -1,15 +1,14 @@
-"""Demand randomization utilities for EPANET RL environments.
+"""需水随机化工具（论文两阶段口径）。
 
-This module provides pure functions to:
-1) sample truncated-normal multipliers in (1 - delta, 1 + delta),
-2) generate time multipliers,
-3) generate space multipliers,
-4) combine default demand pattern and base demands into randomized demands.
-
-Design notes:
-- All randomness is driven by an explicit ``numpy.random.Generator``.
-- No global state is used.
-- A mask interface is reserved for "large users are not randomized".
+教学导读：
+1. 论文明确给出的：
+   - 时间乘子与空间乘子均来自截断正态，范围 `(1-Δ, 1+Δ)`；
+   - 最终 demand 由默认模式、时间乘子、空间乘子和 base demand 共同决定。
+2. 当前仓库实现：
+   - 随机性全部通过显式 `numpy.random.Generator` 传入，保证可复现；
+   - 提供一站式 `generate_randomized_demands`，也保留分步函数方便单测。
+3. 工程细节：
+   - 采样失败时有兜底策略（clip 补齐），优先保证批处理稳定返回。
 """
 
 from __future__ import annotations
@@ -21,6 +20,8 @@ from numpy.typing import ArrayLike, NDArray
 
 
 def _validate_delta(delta: float, name: str) -> None:
+    """统一校验 delta 边界，保证乘子保持正值。"""
+
     if delta < 0:
         raise ValueError(f"{name} must be >= 0, got {delta}.")
     if delta >= 1:
@@ -28,6 +29,8 @@ def _validate_delta(delta: float, name: str) -> None:
 
 
 def _as_bool_mask(mask: ArrayLike, expected_size: int) -> NDArray[np.bool_]:
+    """将输入转换为布尔 mask，并校验长度一致。"""
+
     arr = np.asarray(mask, dtype=bool).reshape(-1)
     if arr.size != expected_size:
         raise ValueError(f"Mask size mismatch: expected {expected_size}, got {arr.size}.")
@@ -43,10 +46,12 @@ def sample_truncated_normal(
     std: float | None = None,
     max_rounds: int = 100,
 ) -> NDArray[np.float64]:
-    """Sample from a truncated normal distribution in [mean-delta, mean+delta].
+    """在 [mean-delta, mean+delta] 上采样截断正态。
 
-    Sampling method: rejection sampling.
-    If ``std`` is None, ``std = delta / 3`` is used.
+    采样方法：
+    - 先做 rejection sampling；
+    - 超过 max_rounds 仍未填满时，对剩余位置做 clip 兜底，
+      以保证函数总能返回结果，避免隐式死循环。
     """
 
     _validate_delta(delta, "delta")
@@ -89,8 +94,8 @@ def sample_truncated_normal(
         result[accepted] = candidates[accepted]
         filled[accepted] = True
 
-    # Fallback to nearest bound if rejection sampling did not finish.
-    # This keeps function total and avoids hidden infinite loops.
+    # 兜底：若拒绝采样回合数耗尽，使用 clip 补齐剩余样本。
+    # 这样做的目标是“稳定可返回”，而不是追求严格的理论截断分布抽样效率最优。
     if np.any(~filled):
         candidates = rng.normal(loc=mean, scale=std, size=out_shape)
         candidates = np.clip(candidates, low, high)
@@ -106,7 +111,7 @@ def generate_time_multipliers(
     rng: np.random.Generator,
     std_time: float | None = None,
 ) -> NDArray[np.float64]:
-    """Generate per-timestep multipliers with truncated normal in (1-delta, 1+delta)."""
+    """生成按时间步变化的随机乘子。"""
 
     if num_steps < 0:
         raise ValueError(f"num_steps must be >= 0, got {num_steps}.")
@@ -128,12 +133,11 @@ def generate_space_multipliers(
     std_space: float | None = None,
     randomizable_mask: ArrayLike | None = None,
 ) -> NDArray[np.float64]:
-    """Generate per-node multipliers with optional mask for non-randomized users.
+    """生成按节点变化的随机乘子（支持固定节点）。
 
-    ``randomizable_mask``:
-    - True  -> node is randomized
-    - False -> node multiplier is fixed at 1.0
-    This is the reserved interface for "large users are not randomized".
+    `randomizable_mask` 语义：
+    - True：该节点参与随机化
+    - False：该节点乘子固定为 1.0
     """
 
     if num_nodes < 0:
@@ -164,19 +168,24 @@ def compose_randomized_demands(
     time_multipliers: ArrayLike,
     space_multipliers: ArrayLike,
 ) -> NDArray[np.float64]:
-    """Compose randomized demand matrix from pattern, base demands, and multipliers.
+    """组合得到最终随机需水矩阵（本文件最关键公式）。
 
-    Formula:
+    公式：
         demand[t, i] =
             base_demands[i]
             * default_pattern[t]
             * time_multipliers[t]
             * space_multipliers[i]
 
-    Returns:
-        2D array with shape (T, N), where:
-        - T is the number of time steps
-        - N is the number of demand nodes
+    输入语义：
+    - `base_demands`：各节点基础需水；
+    - `default_pattern`：原始时序模式；
+    - `time_multipliers`：时间随机乘子；
+    - `space_multipliers`：空间随机乘子。
+
+    返回：
+    - 形状 `(T, N)` 的二维数组；
+    - `T` 为时间步数，`N` 为需求节点数。
     """
 
     base = np.asarray(base_demands, dtype=np.float64).reshape(-1)
@@ -211,12 +220,12 @@ def generate_randomized_demands(
     std_space: float | None = None,
     randomizable_mask: ArrayLike | None = None,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
-    """Convenience pure function for environment usage.
+    """环境侧常用的一站式随机化接口。
 
-    Returns:
-    - randomized_demands: shape (T, N)
-    - time_multipliers: shape (T,)
-    - space_multipliers: shape (N,)
+    返回三元组：
+    - randomized_demands: `(T, N)`
+    - time_multipliers: `(T,)`
+    - space_multipliers: `(N,)`
     """
 
     base = np.asarray(base_demands, dtype=np.float64).reshape(-1)

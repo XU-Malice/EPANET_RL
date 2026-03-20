@@ -1,19 +1,17 @@
-"""WNTR/EPANET single-step environment for Net3 pump scheduling.
+"""Net3 的 WNTR/EPANET 主线环境（论文复现核心）。
 
-This environment is separate from the minimal proxy env in ``env.py``.
-It performs a real hydraulic simulation each step using WNTR + EPANET toolkit.
-
-Key behaviors:
-- 24-step episode, 1 hour per step.
-- Action sets two pump speeds (discrete action id from action_space.py).
-- Each step updates current-hour junction demands and tank initial levels.
-- Runs one-hour EPANET hydraulic simulation and extracts results.
-- Reward is computed via reward.py.
-- Observation = [junction demands, tank levels].
-
-Current scope:
-- r_benchmark can be hard-coded (development placeholder).
-- Z-score scaling interface is provided, but not calibrated by 10k rollouts.
+教学导读（先看这里）：
+1. 论文明确给出的：
+   - 一个 episode = 24 步，每步 1 小时；
+   - 状态由 demand + tank levels 组成；
+   - 水力违例需要给大惩罚并提前终止。
+2. 当前仓库实现：
+   - 使用 WNTR/EPANET 做真实单步仿真；
+   - 在 `step()` 的 `info` 里保留较完整诊断字段；
+   - 奖励逻辑统一委托给 `reward.py`。
+3. 工程可运行近似：
+   - 为提升稳定性，提供 NaN fallback、tank level 裁剪等数值保护分支；
+   - 这些保护逻辑用于“训练可跑、易排障”，不改变论文主线语义。
 """
 
 from __future__ import annotations
@@ -67,7 +65,17 @@ class _Net3Meta:
 
 
 class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
-    """Real single-step hydraulic environment backed by WNTR/EPANET."""
+    """基于 WNTR/EPANET 的单步真实水力环境。
+
+    输入：
+    - 离散动作 `action_id`（0..63），由两台泵速度组合映射得到。
+
+    输出：
+    - Gymnasium 标准五元组 `(obs, reward, terminated, truncated, info)`。
+
+    复现关系：
+    - 这是论文复现主线环境，不建议用 `env.py` 替代训练主流程。
+    """
 
     metadata = {"render_modes": []}
 
@@ -109,6 +117,10 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
             raise ValueError(f"delta_space must be in [0,1), got {delta_space}.")
         if scaling_mode not in ("none", "max_min", "z_score"):
             raise ValueError(f"Unsupported scaling_mode: {scaling_mode}.")
+        if p_hydraulic >= 0.0:
+            raise ValueError(
+                f"p_hydraulic must be negative to represent a large penalty, got {p_hydraulic}."
+            )
         if pump_efficiency <= 0.0:
             raise ValueError(f"pump_efficiency must be positive, got {pump_efficiency}.")
         if tank_level_epsilon < 0.0:
@@ -131,6 +143,7 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
         self.demand_std_time = demand_std_time
         self.demand_std_space = demand_std_space
 
+        # 不直接改原始 Net3.inp：先生成临时“修改版 INP”供仿真使用。
         self._tmp_dir = Path(tempfile.mkdtemp(prefix="epanet_rl_wntr_"))
         self._modified_inp_path = self._tmp_dir / "net3_modified_for_wntr.inp"
         self._prepare_modified_inp()
@@ -163,7 +176,7 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
         self.action_space = spaces.Discrete(ACTION_COUNT)
         self.observation_space = self._build_observation_space()
 
-        # Runtime state (set in reset()).
+        # 运行态（每次 reset 会重置）。
         self._rng: np.random.Generator | None = None
         self._step_index = 0
         self._done = False
@@ -179,7 +192,13 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
         seed: int | None = None,
         options: dict | None = None,
     ) -> tuple[NDArray[np.float32], dict]:
-        """Reset episode and sample randomized hourly demand trajectory."""
+        """重置 episode 并采样 24 小时 demand 轨迹。
+
+        关键点：
+        - 每次 reset 都会重新采样 demand 时间/空间乘子；
+        - 初始 tank level 在 `[min, max]` 内均匀随机；
+        - 返回的 `info` 包含乘子与设备名称，便于离线审计。
+        """
 
         super().reset(seed=seed)
         self._rng = self.np_random
@@ -200,7 +219,7 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
         self._time_multipliers = time_mul
         self._space_multipliers = space_mul
 
-        # Initial tank levels are uniformly sampled in [min_level, max_level].
+        # 论文语义：初始 tank level 在 [min, max] 内均匀随机。
         self._tank_levels = self._rng.uniform(low=self._tank_min_levels, high=self._tank_max_levels)
         self._initial_tank_volume = self._compute_total_tank_volume(self._tank_levels)
 
@@ -215,7 +234,13 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
         return obs, info
 
     def step(self, action: int) -> tuple[NDArray[np.float32], float, bool, bool, dict]:
-        """Run one-hour WNTR/EPANET simulation for the current action."""
+        """执行当前动作对应的 1 小时仿真，并返回 Gym step 五元组。
+
+        教学提示：
+        - 先做动作解码与 tank level 数值保护，再跑仿真；
+        - 奖励与终止语义由 `reward.compute_total_reward` 决定；
+        - `info` 字段是后续 benchmark/评估/排障的主要数据来源。
+        """
 
         if self._done:
             raise RuntimeError("Episode is done. Call reset() before step().")
@@ -225,6 +250,7 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
         original_action = int(action)
         current_demands = self._current_demands[self._step_index]
         commanded_pump_speeds = action_id_to_speeds(original_action)
+        # 在求解前先对 tank level 做轻微裁剪，减少“卡在边界”导致的数值不稳定。
         sim_tank_levels, tank_level_clipped = self._sanitize_tank_levels_for_simulation(self._tank_levels)
 
         executed_pump_speeds = commanded_pump_speeds
@@ -238,6 +264,7 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
                 current_demands,
                 sim_tank_levels,
             )
+            # 若原动作仿真输出出现 NaN，可按配置走 fallback（0,0）动作。
             if self._sim_output_has_nan(sim_output):
                 original_action_failed = True
                 if self.enable_nan_fallback:
@@ -253,7 +280,25 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
             final_tank_volume = self._compute_total_tank_volume(self._tank_levels)
             hydraulic_violation = bool(sim_output["hydraulic_violation"])
             e_pump_t = float(sim_output["pump_energy_cost"])
+            energy_cost_mode = str(sim_output.get("energy_cost_mode", "single_point"))
+            energy_time_point_count = int(sim_output.get("energy_time_point_count", 1))
+            energy_time_span_seconds = sim_output.get("energy_time_span_seconds")
+            energy_raw_time_point_count = int(sim_output.get("energy_raw_time_point_count", 0))
+            energy_raw_time_index_type = sim_output.get("energy_raw_time_index_type")
+            energy_integration_attempted = bool(sim_output.get("energy_integration_attempted", False))
+            energy_integration_failure_reason = sim_output.get("energy_integration_failure_reason")
             min_pressure = float(sim_output["min_pressure"])
+            min_pressure_end_time = float(sim_output.get("min_pressure_end_time", min_pressure))
+            min_pressure_over_step = float(
+                sim_output.get("min_pressure_over_step", min_pressure_end_time)
+            )
+            pressure_time_point_count = int(sim_output.get("pressure_time_point_count", 1))
+            hydraulic_violation_end_time_rule = bool(
+                sim_output.get("hydraulic_violation_end_time_rule", hydraulic_violation)
+            )
+            hydraulic_violation_full_step_rule = bool(
+                sim_output.get("hydraulic_violation_full_step_rule", hydraulic_violation_end_time_rule)
+            )
             pump_flows = sim_output["pump_flows"]
             pump_heads = sim_output["pump_head_gains"]
         except Exception:
@@ -274,7 +319,25 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
                     final_tank_volume = self._compute_total_tank_volume(self._tank_levels)
                     hydraulic_violation = bool(sim_output["hydraulic_violation"])
                     e_pump_t = float(sim_output["pump_energy_cost"])
+                    energy_cost_mode = str(sim_output.get("energy_cost_mode", "single_point"))
+                    energy_time_point_count = int(sim_output.get("energy_time_point_count", 1))
+                    energy_time_span_seconds = sim_output.get("energy_time_span_seconds")
+                    energy_raw_time_point_count = int(sim_output.get("energy_raw_time_point_count", 0))
+                    energy_raw_time_index_type = sim_output.get("energy_raw_time_index_type")
+                    energy_integration_attempted = bool(sim_output.get("energy_integration_attempted", False))
+                    energy_integration_failure_reason = sim_output.get("energy_integration_failure_reason")
                     min_pressure = float(sim_output["min_pressure"])
+                    min_pressure_end_time = float(sim_output.get("min_pressure_end_time", min_pressure))
+                    min_pressure_over_step = float(
+                        sim_output.get("min_pressure_over_step", min_pressure_end_time)
+                    )
+                    pressure_time_point_count = int(sim_output.get("pressure_time_point_count", 1))
+                    hydraulic_violation_end_time_rule = bool(
+                        sim_output.get("hydraulic_violation_end_time_rule", hydraulic_violation)
+                    )
+                    hydraulic_violation_full_step_rule = bool(
+                        sim_output.get("hydraulic_violation_full_step_rule", hydraulic_violation_end_time_rule)
+                    )
                     pump_flows = sim_output["pump_flows"]
                     pump_heads = sim_output["pump_head_gains"]
                 except Exception:
@@ -283,7 +346,19 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
                     final_tank_volume = self._compute_total_tank_volume(self._tank_levels)
                     hydraulic_violation = True
                     e_pump_t = 0.0
+                    energy_cost_mode = "single_point"
+                    energy_time_point_count = 1
+                    energy_time_span_seconds = None
+                    energy_raw_time_point_count = 0
+                    energy_raw_time_index_type = None
+                    energy_integration_attempted = False
+                    energy_integration_failure_reason = "exception:simulate_single_step_failed"
                     min_pressure = float("nan")
+                    min_pressure_end_time = float("nan")
+                    min_pressure_over_step = float("nan")
+                    pressure_time_point_count = 0
+                    hydraulic_violation_end_time_rule = True
+                    hydraulic_violation_full_step_rule = True
                     pump_flows = np.full(2, np.nan, dtype=np.float64)
                     pump_heads = np.full(2, np.nan, dtype=np.float64)
             else:
@@ -293,10 +368,23 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
                 final_tank_volume = self._compute_total_tank_volume(self._tank_levels)
                 hydraulic_violation = True
                 e_pump_t = 0.0
+                energy_cost_mode = "single_point"
+                energy_time_point_count = 1
+                energy_time_span_seconds = None
+                energy_raw_time_point_count = 0
+                energy_raw_time_index_type = None
+                energy_integration_attempted = False
+                energy_integration_failure_reason = "exception:simulate_single_step_failed"
                 min_pressure = float("nan")
+                min_pressure_end_time = float("nan")
+                min_pressure_over_step = float("nan")
+                pressure_time_point_count = 0
+                hydraulic_violation_end_time_rule = True
+                hydraulic_violation_full_step_rule = True
                 pump_flows = np.full(2, np.nan, dtype=np.float64)
                 pump_heads = np.full(2, np.nan, dtype=np.float64)
 
+        # reward 与终止语义完全交给 reward.py，环境这里只负责提供输入。
         reward_result = compute_total_reward(
             StepRewardInput(
                 t=self._step_index,
@@ -316,8 +404,16 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
         self._step_index += 1
         truncated = bool((self._step_index >= self.EPISODE_STEPS) and not terminated)
         self._done = bool(terminated or truncated)
+        # 统一终止原因，便于训练日志与离线统计脚本做归因分析。
+        if terminated and hydraulic_violation:
+            termination_reason: str | None = "hydraulic_violation"
+        elif truncated:
+            termination_reason = "horizon_reached"
+        else:
+            termination_reason = None
 
         obs = self._get_obs()
+        # info 保留较完整诊断信息，方便 benchmark / diagnose / 训练排障复用。
         info = {
             "step_index": self._step_index,
             "pump_names": self._pump_names,
@@ -331,16 +427,31 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
             "pump_flows": pump_flows.copy(),
             "pump_head_gains": pump_heads.copy(),
             "e_pump_t": e_pump_t,
+            "energy_cost_mode": energy_cost_mode,
+            "energy_time_point_count": energy_time_point_count,
+            "energy_time_span_seconds": (
+                None if energy_time_span_seconds is None else float(energy_time_span_seconds)
+            ),
+            "energy_raw_time_point_count": energy_raw_time_point_count,
+            "energy_raw_time_index_type": energy_raw_time_index_type,
+            "energy_integration_attempted": energy_integration_attempted,
+            "energy_integration_failure_reason": energy_integration_failure_reason,
             "base_reward": reward_result.base_reward,
             "tank_penalty": reward_result.tank_penalty,
             "hydraulic_violation": hydraulic_violation,
             "min_pressure": min_pressure,
+            "min_pressure_end_time": min_pressure_end_time,
+            "min_pressure_over_step": min_pressure_over_step,
+            "pressure_time_point_count": pressure_time_point_count,
+            "hydraulic_violation_end_time_rule": hydraulic_violation_end_time_rule,
+            "hydraulic_violation_full_step_rule": hydraulic_violation_full_step_rule,
             "tank_levels": self._tank_levels.copy(),
             "tank_levels_for_sim": sim_tank_levels.copy(),
             "tank_level_clipped_before_sim": tank_level_clipped,
             "sim_failure_caught": sim_failure_caught,
             "initial_tank_volume": self._initial_tank_volume,
             "final_tank_volume": final_tank_volume,
+            "termination_reason": termination_reason,
         }
         return obs, float(reward_result.reward), terminated, truncated, info
 
@@ -350,7 +461,18 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
         current_demands: NDArray[np.float64],
         tank_init_levels: NDArray[np.float64],
     ) -> dict[str, NDArray[np.float64] | float | bool]:
-        """Simulate one hydraulic hour and return extracted outputs."""
+        """仿真 1 小时并提取本 step 所需的水力结果。
+
+        输入：
+        - `pump_speeds`: 两台泵本步执行速度；
+        - `current_demands`: 当前小时各节点 demand；
+        - `tank_init_levels`: 本步起始 tank levels。
+
+        返回字典（节选）：
+        - `tank_levels`, `hydraulic_violation`, `pump_energy_cost`
+        - `pump_flows`, `pump_head_gains`, `min_pressure`
+        - 若有诊断逻辑，还会附带 energy/pressure 相关诊断字段。
+        """
 
         wn = wntr.network.WaterNetworkModel(str(self._modified_inp_path))
         self._configure_one_hour_options(wn)
@@ -365,34 +487,87 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
         tank_heads = results.node["head"].loc[end_time, list(self._tank_names)].to_numpy(dtype=np.float64)
         tank_levels = tank_heads - self._tank_elevations
 
-        junction_pressures = results.node["pressure"].loc[end_time, list(self._junction_names)].to_numpy(dtype=np.float64)
-        min_pressure = float(np.nanmin(junction_pressures))
-        hydraulic_violation = bool(np.any(np.isnan(junction_pressures)) or (min_pressure < self.pressure_violation_threshold))
+        pressure_frame = results.node["pressure"].loc[:, list(self._junction_names)]
+        pressure_time_point_count = int(len(pressure_frame.index))
+        junction_pressures = pressure_frame.loc[end_time].to_numpy(dtype=np.float64)
+        all_pressures = pressure_frame.to_numpy(dtype=np.float64)
+        min_pressure_end_time = float(np.nanmin(junction_pressures))
+        if np.isnan(all_pressures).all():
+            min_pressure_over_step = float("nan")
+        else:
+            min_pressure_over_step = float(np.nanmin(all_pressures))
+        hydraulic_violation_end_time_rule = bool(
+            np.any(np.isnan(junction_pressures))
+            or (min_pressure_end_time < self.pressure_violation_threshold)
+        )
+        hydraulic_violation_full_step_rule = bool(
+            np.any(np.isnan(all_pressures))
+            or (min_pressure_over_step < self.pressure_violation_threshold)
+        )
 
-        pump_flows = np.abs(results.link["flowrate"].loc[end_time, list(self._pump_names)].to_numpy(dtype=np.float64))
-        pump_headloss = results.link["headloss"].loc[end_time, list(self._pump_names)].to_numpy(dtype=np.float64)
+        # 当前主逻辑保持不变：违例判定仍以“末时刻压力规则”为准。
+        # full-step 压力信息仅作为诊断输出，不参与终止决策。
+        hydraulic_violation = hydraulic_violation_end_time_rule
+        min_pressure = min_pressure_end_time
+
+        pump_flow_frame = results.link["flowrate"].loc[:, list(self._pump_names)]
+        pump_headloss_frame = results.link["headloss"].loc[:, list(self._pump_names)]
+        raw_time_index = pump_flow_frame.index
+        energy_raw_time_point_count = int(len(raw_time_index))
+        raw_time_index_dtype = getattr(raw_time_index, "dtype", None)
+        if raw_time_index_dtype is None:
+            energy_raw_time_index_type = type(raw_time_index).__name__
+        else:
+            energy_raw_time_index_type = f"{type(raw_time_index).__name__}:{raw_time_index_dtype}"
+
+        # 诊断输出仍以 step 末时刻的泵工况为主。
+        pump_flows = np.abs(pump_flow_frame.loc[end_time].to_numpy(dtype=np.float64))
+        pump_headloss = pump_headloss_frame.loc[end_time].to_numpy(dtype=np.float64)
         pump_head_gains = np.maximum(0.0, -pump_headloss)
-        pump_energy_cost = self._compute_pump_energy_cost(pump_flows, pump_head_gains, hour=self._step_index)
+
+        # 当前能耗口径：single_point（沿用稳健的一点估算，避免引入额外求积风险）。
+        pump_energy_cost = self._compute_pump_energy_cost(
+            pump_flows,
+            pump_head_gains,
+            hour=self._step_index,
+        )
+        energy_cost_mode = "single_point"
+        energy_time_point_count = 1
+        energy_time_span_seconds: float | None = None
+        energy_integration_attempted = False
+        energy_integration_failure_reason: str | None = "none"
 
         return {
             "tank_levels": tank_levels,
             "hydraulic_violation": hydraulic_violation,
             "min_pressure": min_pressure,
+            "min_pressure_end_time": min_pressure_end_time,
+            "min_pressure_over_step": min_pressure_over_step,
+            "pressure_time_point_count": pressure_time_point_count,
+            "hydraulic_violation_end_time_rule": hydraulic_violation_end_time_rule,
+            "hydraulic_violation_full_step_rule": hydraulic_violation_full_step_rule,
             "pump_flows": pump_flows,
             "pump_head_gains": pump_head_gains,
             "pump_energy_cost": pump_energy_cost,
+            "energy_cost_mode": energy_cost_mode,
+            "energy_time_point_count": energy_time_point_count,
+            "energy_time_span_seconds": energy_time_span_seconds,
+            "energy_raw_time_point_count": energy_raw_time_point_count,
+            "energy_raw_time_index_type": energy_raw_time_index_type,
+            "energy_integration_attempted": energy_integration_attempted,
+            "energy_integration_failure_reason": energy_integration_failure_reason,
         }
 
     def _sanitize_tank_levels_for_simulation(
         self,
         tank_levels: NDArray[np.float64],
     ) -> tuple[NDArray[np.float64], bool]:
-        """Clip tank levels away from exact bounds for solver stability."""
+        """将 tank level 与边界拉开极小距离，提升求解稳定性。"""
 
         lower = self._tank_min_levels + self.tank_level_epsilon
         upper = self._tank_max_levels - self.tank_level_epsilon
 
-        # If a tank has very narrow valid range, use the midpoint as stable value.
+        # 极端情况下若上下界几乎重合，用中点替代可降低求解器异常概率。
         invalid = upper <= lower
         if np.any(invalid):
             midpoint = (self._tank_min_levels + self._tank_max_levels) / 2.0
@@ -417,6 +592,13 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
         )
 
     def _configure_one_hour_options(self, wn) -> None:
+        """配置“外部决策步长=1 小时”的仿真时间参数。
+
+        注意：
+        - 这里约束的是环境主语义（每次 step 代表 1 小时）；
+        - 如需改变内部更细时间分辨率，应在不破坏主语义前提下单独设计。
+        """
+
         wn.options.time.duration = self.STEP_SECONDS
         wn.options.time.hydraulic_timestep = self.STEP_SECONDS
         wn.options.time.report_timestep = self.STEP_SECONDS
@@ -428,6 +610,8 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
             tank.init_level = float(level)
 
     def _apply_hourly_demands(self, wn, current_demands: NDArray[np.float64]) -> None:
+        """把当前 step 的 demand 写入 WNTR 网络对象。"""
+
         for junction_name, demand_value in zip(self._junction_names, current_demands):
             junction = wn.get_node(junction_name)
             if len(junction.demand_timeseries_list) == 0:
@@ -439,6 +623,8 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
                 extra.pattern_name = None
 
     def _apply_pump_speeds(self, wn, pump_speeds: tuple[float, float]) -> None:
+        """把动作对应的两泵速度写入网络模型。"""
+
         for pump_name, speed in zip(self._pump_names, pump_speeds):
             pump = wn.get_link(pump_name)
             pump.base_speed = float(speed)
@@ -452,7 +638,12 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
         *,
         hour: int,
     ) -> float:
-        """Compute one-step pump electricity cost from simulated hydraulic outputs."""
+        """按 `Q/H/η` 估算单步泵电费（美元）。
+
+        公式口径：
+        - 先估算每台泵功率，再折算到本步时长对应能耗；
+        - 最后按时段电价（峰/谷）换算为美元成本。
+        """
 
         power_w = (
             self.WATER_DENSITY_KG_PER_M3
@@ -462,6 +653,7 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
             / self.pump_efficiency
         )
         energy_kwh = power_w * self.STEP_SECONDS / 3_600_000.0
+        # 电价按 step 所在小时选择峰/谷价。
         unit_price = self._electricity_price_for_hour(hour)
         return float(np.sum(energy_kwh) * unit_price)
 
@@ -470,7 +662,12 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
         return PEAK_PRICE_USD_PER_KWH if 7 <= hour < 23 else OFFPEAK_PRICE_USD_PER_KWH
 
     def _get_obs(self) -> NDArray[np.float32]:
-        """Build observation = [current-hour demands, current tank levels]."""
+        """构建观测向量：`[当前小时 demand, 当前 tank levels]`。
+
+        这也是论文复现中的关键状态定义来源之一：
+        - 不把 pressure 等结果变量放入状态；
+        - 按 `scaling_mode` 对 demand/tank 分别缩放。
+        """
 
         if self._step_index >= self.EPISODE_STEPS:
             demands = np.zeros(self._base_demands.size, dtype=np.float64)
@@ -526,6 +723,8 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
         return np.asarray([node_id not in fixed_ids for node_id in self._junction_names], dtype=bool)
 
     def _prepare_scaling_statistics(self) -> None:
+        """准备 max-min / z-score 所需的固定统计量。"""
+
         pattern_min = float(np.min(self._default_pattern))
         pattern_max = float(np.max(self._default_pattern))
 
@@ -560,6 +759,8 @@ class Net3WntrEnv(gym.Env[NDArray[np.float32], int]):
         return spaces.Box(low=low, high=high, dtype=np.float32)
 
     def _prepare_modified_inp(self) -> None:
+        """读取原始 INP 并写出临时修改版 INP。"""
+
         if not self.net3_inp_path.exists():
             raise FileNotFoundError(f"Net3 INP file not found: {self.net3_inp_path}")
         original_text = self.net3_inp_path.read_text(encoding="utf-8")

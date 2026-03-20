@@ -1,17 +1,15 @@
-"""Reward utilities for EPANET RL environments.
+"""EPANET RL 奖励函数工具（纯函数版）。
 
-Implemented rules:
-1) Regular step reward:
-   reward = r_benchmark / 24 - E_pump_t
-2) Hydraulic violation:
-   reward = P_hydraulic, and episode terminates
-3) At t == 23, if final tank volume < initial tank volume:
-   total reward = regular reward + P_tank
-4) P_tank supports two modes:
-   - proportional: C_tank * ((initial - final) / initial) * r_benchmark
-   - constant: fixed value
-
-All functions are pure and side-effect free.
+教学导读：
+1. 论文明确给出的：
+   - 常规步奖励：`r_benchmark / 24 - E_pump_t`
+   - 水力违例：给大负惩罚并提前终止
+   - tank penalty：仅在最后一步检查
+2. 当前仓库实现：
+   - 用纯函数组织，便于单元测试与环境复用
+   - 通过 `compute_total_reward` 明确“违例优先级高于一切”
+3. 工程近似说明：
+   - `TankPenaltyConfig` 提供 proportional/constant 两种形式，便于实验切换。
 """
 
 from __future__ import annotations
@@ -24,7 +22,7 @@ TankPenaltyMode = Literal["proportional", "constant"]
 
 @dataclass(frozen=True)
 class TankPenaltyConfig:
-    """Configuration for final-step tank penalty."""
+    """末步水箱惩罚配置。"""
 
     mode: TankPenaltyMode
     constant_value: float = 0.0
@@ -37,7 +35,7 @@ class TankPenaltyConfig:
 
 @dataclass(frozen=True)
 class StepRewardInput:
-    """Inputs required to compute reward for one environment step."""
+    """单步奖励计算所需输入。"""
 
     t: int
     e_pump_t: float
@@ -50,7 +48,7 @@ class StepRewardInput:
 
 @dataclass(frozen=True)
 class RewardResult:
-    """Reward output for one step."""
+    """单步奖励计算结果。"""
 
     reward: float
     terminated: bool
@@ -60,7 +58,7 @@ class RewardResult:
 
 
 def compute_regular_reward(r_benchmark: float, e_pump_t: float, horizon_steps: int = 24) -> float:
-    """Compute regular step reward: r_benchmark / horizon_steps - e_pump_t."""
+    """常规奖励：`r_benchmark / horizon_steps - e_pump_t`。"""
 
     if horizon_steps <= 0:
         raise ValueError(f"horizon_steps must be positive, got {horizon_steps}.")
@@ -73,12 +71,12 @@ def compute_tank_penalty(
     r_benchmark: float,
     config: TankPenaltyConfig,
 ) -> float:
-    """Compute P_tank when final tank volume is below initial volume.
+    """计算末步水箱惩罚 P_tank。
 
-    Returns 0.0 when final_tank_volume >= initial_tank_volume.
-    In proportional mode, returns:
-        C_tank * ((initial - final) / initial) * r_benchmark
-    with safety guard for initial_tank_volume <= 0.
+    设计意图：
+    - 若 final >= initial，则无惩罚（返回 0）。
+    - proportional 模式下，按短缺比例与 r_benchmark 成比例惩罚。
+    - 对 initial<=0 做保护，避免除零与非物理放大。
     """
 
     if final_tank_volume >= initial_tank_volume:
@@ -101,12 +99,15 @@ def compute_total_reward(
     horizon_steps: int = 24,
     final_step: int = 23,
 ) -> RewardResult:
-    """Compute total reward and termination flag for one step.
+    """计算单步总奖励并给出是否终止。
 
-    Priority:
-    1) If hydraulic violation occurs, return P_hydraulic and terminate.
-    2) Otherwise use regular reward.
-    3) If this is final_step and final tank is below initial tank, add P_tank.
+    优先级（非常关键）：
+    1) 先看 hydraulic_violation：若违例，直接返回 P_hydraulic 并 terminated=True。
+    2) 未违例时，计算常规奖励。
+    3) 若是 final_step，再按配置追加 tank penalty。
+
+    这个优先级会直接影响训练行为：
+    - 一旦出现违例，不再“奖励抵扣”，而是立即按惩罚结束。
     """
 
     if step.hydraulic_violation:

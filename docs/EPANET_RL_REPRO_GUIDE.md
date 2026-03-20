@@ -1,0 +1,559 @@
+﻿# EPANET_RL 论文复现中文教程（从 0 到可训练）
+
+> 文档定位：面向“几乎从 0 开始”的使用者，帮助你看懂仓库、跑通测试、完成训练与评估。
+>
+> 重要原则：本文只基于当前仓库实际代码与脚本，不编造未实现内容。
+
+---
+
+## 1. 项目总体目标
+
+### 1.1 这个项目在复现什么
+
+当前 `EPANET_RL` 的主线目标是：
+
+- 用强化学习做 EPANET Net3 供水系统的泵调度。
+- 将“1 天调度”建模为 24 步序贯决策任务（每步 1 小时）。
+- 在满足水力约束前提下，尽可能降低泵能耗成本。
+
+### 1.2 为什么主线环境是 `Net3WntrEnv`
+
+主线环境在 [env_wntr.py](/home/dengxu/projects/EPANET_RL/src/epanet_rl/env_wntr.py)（你当前仓库路径下对应 `src/epanet_rl/env_wntr.py`）：
+
+- 每个 step 调用 WNTR/EPANET 做真实水力仿真。
+- 能体现论文复现重点：24 步序贯、tank 状态传递、水力违例提前终止等。
+- 相比 [env.py](/home/dengxu/projects/EPANET_RL/src/epanet_rl/env.py) 的简化版，更适合论文主线训练。
+
+### 1.3 当前 PPO / E-PPO 主线
+
+训练入口是 [train_ppo_net3.py](/home/dengxu/projects/EPANET_RL/scripts/train_ppo_net3.py)：
+
+- `--algo ppo` 或 `--algo eppo`
+- `ppo` 可视为 `sigma=0`
+- `eppo` 常用 `--sigma 0.2`
+- 默认 `r_benchmark=406.54`、`p_hydraulic=-200`、`device=cpu`
+
+---
+
+## 2. 论文信息 vs 当前实现 vs 工程近似（总表）
+
+下面这张表是本项目最关键的“认知对齐”。
+
+| 主题 | 论文明确给出 | 当前仓库已有实现 | 工程可运行近似/说明 |
+|---|---|---|---|
+| 环境时间语义 | 24 步、每步 1 小时 | `Net3WntrEnv.EPISODE_STEPS=24`，`STEP_SECONDS=3600` | 无 |
+| 状态定义 | demand + tank levels | `env_wntr._get_obs()` 按 `[demand, tank]` 拼接 | 无 |
+| 动作空间 | 两泵各 8 档，共 64 | `action_space.py` 固定 8 档并双向映射 | 无 |
+| 违例处理 | 大惩罚 + 提前终止 | `reward.compute_total_reward()` + `env_wntr.step()` | 无 |
+| 奖励主体 | `r_benchmark/24 - E_pump_t` | `reward.compute_regular_reward()` | 无 |
+| tank 末步惩罚 | 末步检查，支持 proportional/constant | `reward.compute_tank_penalty()` | 无 |
+| Net3 预处理 | 控制规则、Pipe330、电价、效率 | `inp_modifier.py` 有文本级修改流程 | 是否与论文原始工程文件完全逐行一致，需实验核验 |
+| PPO 关键超参 | actor/critic 网络与 lr、gamma、clip、epochs | `train_ppo_net3.py` 已参数化并默认对齐 | E-PPO 的“实现细节”通过 SB3 `ent_coef` 映射，不是论文源码逐行复刻 |
+| Z-Score | 需统计 mean/std | `compute_zscore_stats.py` 可产出需求统计 | 统计样本规模由你运行参数决定 |
+
+---
+
+## 3. 仓库结构说明
+
+当前仓库常见顶层目录：
+
+- `src/epanet_rl/`：核心逻辑（环境、奖励、动作、随机化、缩放、INP 处理）。
+- `scripts/`：可执行入口（benchmark、zscore、训练、评估、诊断）。
+- `tests/`：pytest 测试。
+- `networks/`：网络输入文件（`Net3.inp`、`Anytown.inp`）。
+- `outputs/`：训练产物（模型、配置、监控日志）。
+- `logs/`：命令日志、审计日志。
+- `artifacts/`：统计脚本输出（例如 json 结果）。
+- `docs/`：文档。
+
+职责划分建议：
+
+- `src` 是“逻辑真相”，不要在脚本里复制核心逻辑。
+- `scripts` 只做流程编排、统计和参数入口。
+- `tests` 负责论文语义回归和工程契约回归。
+
+---
+
+## 4. 核心源码文件逐个说明
+
+## 4.1 [env_wntr.py](/home/dengxu/projects/EPANET_RL/src/epanet_rl/env_wntr.py)
+
+### 文件目标
+
+实现论文复现主线环境 `Net3WntrEnv`。
+
+### 你需要优先看懂的函数
+
+- `__init__`：参数校验、读取并修改 INP、提取网络元数据、初始化 observation/action space。
+- `reset`：
+  - 生成 demand 随机轨迹（24 小时）
+  - 随机初始 tank level
+  - 返回初始 observation 和诊断 info
+- `step`：
+  - 把 `action_id` 解码为两泵速度
+  - 调用 `_simulate_single_step()` 跑 1 小时仿真
+  - 计算 `e_pump_t`、违例、reward、终止条件
+  - 输出丰富 info（含诊断字段）
+- `_simulate_single_step`：真正的 WNTR/EPANET 单步仿真与结果抽取。
+
+### 输入输出摘要
+
+- 输入：离散动作 `0..63`
+- 输出：Gymnasium 5 元组 `(obs, reward, terminated, truncated, info)`
+
+### 常见坑
+
+- `p_hydraulic` 必须是负值，否则构造时报错。
+- step 后若 `terminated=True`，必须先 `reset()` 才能继续。
+- `info` 字段很关键，benchmark/诊断都依赖它（特别是 `e_pump_t`）。
+
+## 4.2 [reward.py](/home/dengxu/projects/EPANET_RL/src/epanet_rl/reward.py)
+
+### 文件目标
+
+用纯函数实现奖励逻辑，便于测试和复现审计。
+
+### 核心函数
+
+- `compute_regular_reward`: `r_benchmark / 24 - e_pump_t`
+- `compute_tank_penalty`: 末步 tank 惩罚（proportional/constant）
+- `compute_total_reward`: 统一处理违例优先级、末步惩罚叠加与终止标记
+
+### 关键语义
+
+- 如果 `hydraulic_violation=True`，直接返回 `p_hydraulic` 并 `terminated=True`。
+- tank 惩罚只在最后一步检查。
+
+## 4.3 [action_space.py](/home/dengxu/projects/EPANET_RL/src/epanet_rl/action_space.py)
+
+### 文件目标
+
+定义论文动作空间并提供双向映射。
+
+### 关键对象
+
+- `ACTION_LEVELS = (0.0, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0)`
+- `ACTION_COUNT = 64`
+- `action_id_to_speeds` / `speeds_to_action_id`
+
+## 4.4 [demand_randomization.py](/home/dengxu/projects/EPANET_RL/src/epanet_rl/demand_randomization.py)
+
+### 文件目标
+
+按论文两步法生成 demand 随机化：
+
+1. 时间乘子（time multipliers）
+2. 空间乘子（space multipliers）
+3. 最终需求矩阵组合
+
+### 关键函数
+
+- `sample_truncated_normal`
+- `generate_time_multipliers`
+- `generate_space_multipliers`
+- `compose_randomized_demands`
+- `generate_randomized_demands`
+
+## 4.5 [inp_modifier.py](/home/dengxu/projects/EPANET_RL/src/epanet_rl/inp_modifier.py)
+
+### 文件目标
+
+把原始 Net3 INP 转成复现实验更可控的版本。
+
+### 主要做的事
+
+- 删除目标控制规则（`CONTROLS`/`RULES`）。
+- 确保 Pipe330 在 `STATUS` 常闭。
+- 设置 TOU 电价相关 `ENERGY` 与 `PATTERNS` 内容。
+- 设置全局效率参数。
+
+## 4.6 [scaling.py](/home/dengxu/projects/EPANET_RL/src/epanet_rl/scaling.py)
+
+### 文件目标
+
+提供需求和水箱特征缩放：
+
+- Max-Min
+- Z-Score
+
+### 说明
+
+- 这是纯函数工具模块，环境调用它，不在这里维护 episode 状态。
+
+## 4.7 [env.py](/home/dengxu/projects/EPANET_RL/src/epanet_rl/env.py)
+
+### 文件定位
+
+- 简化环境，更多用于流程联调和早期 smoke test。
+- 论文主线训练不使用这个环境。
+
+---
+
+## 5. scripts 脚本逐个说明
+
+## 5.1 [compute_r_benchmark.py](/home/dengxu/projects/EPANET_RL/scripts/compute_r_benchmark.py)
+
+### 作用
+
+随机策略 rollout，统计能耗 benchmark 多口径结果。
+
+### 什么时候用
+
+- 你想核对当前环境下随机策略基准能耗时。
+
+### 常用命令
+
+```bash
+python scripts/compute_r_benchmark.py \
+  --episodes 200 \
+  --seed 42 \
+  --net3-inp networks/Net3.inp \
+  --scaling-mode max_min \
+  --delta-time 0.3 \
+  --delta-space 0.3 \
+  --p-hydraulic -200 \
+  --progress
+```
+
+### 输出怎么看
+
+重点关注：
+
+- `candidate_benchmark_all`
+- `candidate_benchmark_successful`
+- `candidate_benchmark_full_horizon`
+- fallback/non_fallback 分组
+
+## 5.2 [compute_zscore_stats.py](/home/dengxu/projects/EPANET_RL/scripts/compute_zscore_stats.py)
+
+### 作用
+
+统计状态特征均值方差（供 Z-Score 缩放使用）。
+
+### 常用命令
+
+```bash
+python scripts/compute_zscore_stats.py \
+  --episodes 200 \
+  --seed 42 \
+  --net3-inp networks/Net3.inp \
+  --delta-time 0.3 \
+  --delta-space 0.3 \
+  --progress \
+  --output-json artifacts/zscore_stats_net3.json
+```
+
+### 输出怎么看
+
+- `demand_mean` / `demand_std`
+- `tank_mean` / `tank_std`
+
+## 5.3 [train_ppo_net3.py](/home/dengxu/projects/EPANET_RL/scripts/train_ppo_net3.py)
+
+### 作用
+
+主线训练入口（PPO / E-PPO）。
+
+### 常用命令
+
+PPO 冒烟：
+
+```bash
+python scripts/train_ppo_net3.py \
+  --algo ppo \
+  --total-timesteps 2000 \
+  --seed 42 \
+  --net3-inp networks/Net3.inp \
+  --delta-time 0.1 \
+  --delta-space 0.1 \
+  --scaling-mode max_min \
+  --r-benchmark 406.54 \
+  --p-hydraulic -200 \
+  --device cpu
+```
+
+E-PPO 冒烟：
+
+```bash
+python scripts/train_ppo_net3.py \
+  --algo eppo \
+  --sigma 0.2 \
+  --total-timesteps 2000 \
+  --seed 42 \
+  --net3-inp networks/Net3.inp \
+  --delta-time 0.1 \
+  --delta-space 0.1 \
+  --scaling-mode max_min \
+  --r-benchmark 406.54 \
+  --p-hydraulic -200 \
+  --device cpu
+```
+
+### 输出怎么看
+
+每个 `outputs/ppo_net3/run_*` 中至少有：
+
+- `train_config.json`
+- `train_summary.json`
+- `optimizer_lrs.json`
+- `vec_monitor.csv`
+- `sb3_logs/progress.csv`
+
+## 5.4 [evaluate_policy_net3.py](/home/dengxu/projects/EPANET_RL/scripts/evaluate_policy_net3.py)
+
+### 作用
+
+离线评估训练好的策略，输出 reward/energy/tank 审计指标。
+
+### 常用命令
+
+```bash
+python scripts/evaluate_policy_net3.py \
+  --model-path outputs/ppo_net3/run_xxx/ppo_net3_model.zip \
+  --algo ppo \
+  --episodes 100 \
+  --seed 42 \
+  --net3-inp networks/Net3.inp \
+  --delta-time 0.1 \
+  --delta-space 0.1 \
+  --scaling-mode max_min \
+  --r-benchmark 406.54 \
+  --p-hydraulic -200 \
+  --output-json artifacts/eval_ppo.json
+```
+
+### 输出怎么看
+
+重点指标：
+
+- `mean_total_reward`
+- `mean_total_energy_cost`
+- `hydraulic_violation_rate`
+- `successful_episode_rate`
+- `successful_mean_total_energy_cost`
+- `mean_total_tank_penalty`
+- `mean_volume_change_ratio`
+
+## 5.5 [diagnose_env_wntr_rollout.py](/home/dengxu/projects/EPANET_RL/scripts/diagnose_env_wntr_rollout.py)
+
+### 作用
+
+逐步打印环境关键字段，用于定位早停、违例、压力异常等问题。
+
+### 常用命令
+
+```bash
+python scripts/diagnose_env_wntr_rollout.py --seed 42 --max-steps 24
+```
+
+---
+
+## 6. tests 测试文件说明
+
+核心测试文件及作用：
+
+- [test_action_space.py](/home/dengxu/projects/EPANET_RL/tests/test_action_space.py)
+  - 验证 64 动作定义与映射可逆。
+- [test_demand_randomization.py](/home/dengxu/projects/EPANET_RL/tests/test_demand_randomization.py)
+  - 验证截断正态范围与 demand 组合公式。
+- [test_reward.py](/home/dengxu/projects/EPANET_RL/tests/test_reward.py)
+  - 验证 reward 主结构与末步 tank penalty。
+- [test_scaling.py](/home/dengxu/projects/EPANET_RL/tests/test_scaling.py)
+  - 验证缩放边界与零方差稳定性。
+- [test_inp_modifier_net3.py](/home/dengxu/projects/EPANET_RL/tests/test_inp_modifier_net3.py)
+  - 验证 Net3 修改规则是否按预期生效。
+- [test_env_wntr_contract.py](/home/dengxu/projects/EPANET_RL/tests/test_env_wntr_contract.py)
+  - 验证主环境关键契约（违例终止、fallback、参数校验）。
+- [test_env_wntr_paper_requirements.py](/home/dengxu/projects/EPANET_RL/tests/test_env_wntr_paper_requirements.py)
+  - 验证论文语义相关需求（24步/状态结构/动作等）。
+
+如何区分：
+
+- 论文需求导向：`*paper_requirements.py`
+- 工程稳定性导向：`*contract.py` + 各模块纯函数单测
+
+---
+
+## 7. 环境准备与依赖检查
+
+## 7.1 进入虚拟环境
+
+```bash
+cd /home/dengxu/projects/EPANET_RL
+source ~/epanet_rl/bin/activate
+```
+
+## 7.2 检查 python 路径
+
+```bash
+which python
+python -V
+python -c "import sys; print(sys.executable)"
+```
+
+## 7.3 检查核心依赖
+
+```bash
+python -c "import numpy, gymnasium, wntr; print(numpy.__version__, gymnasium.__version__, wntr.__version__)"
+python -c "import torch, stable_baselines3 as sb3; print(torch.__version__, sb3.__version__)"
+```
+
+## 7.4 检查 GPU 可见性（可选）
+
+```bash
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.device_count())"
+```
+
+## 7.5 为什么训练默认建议 CPU
+
+当前是 `MlpPolicy` + 单环境主流程，CPU 训练通常更稳定、更易复现和排障，因此脚本默认 `--device cpu`。
+
+---
+
+## 8. 分步测试教程（命令 + 结果解释）
+
+## 8.1 全量测试
+
+```bash
+python -m pytest -q
+```
+
+正常现象：
+
+- 大部分测试通过。
+- 若有 `xfailed`，通常是仓库中明确标记的“暂未完全实现项”。
+
+异常通常意味着：
+
+- 依赖缺失（wntr/torch/sb3 等）。
+- 环境或奖励逻辑契约回归。
+
+## 8.2 单步环境合同检查
+
+```bash
+python - <<'PY'
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path('src').resolve()))
+from epanet_rl.env_wntr import Net3WntrEnv
+
+env = Net3WntrEnv(net3_inp_path='networks/Net3.inp', scaling_mode='max_min', r_benchmark=406.54, p_hydraulic=-200)
+obs, info = env.reset(seed=42)
+obs2, reward, terminated, truncated, info2 = env.step(63)
+print('obs_shape', obs.shape, 'next_obs_shape', obs2.shape)
+print('reward', reward, 'terminated', terminated, 'truncated', truncated)
+print('e_pump_t', info2.get('e_pump_t'))
+print('hydraulic_violation', info2.get('hydraulic_violation'))
+print('termination_reason', info2.get('termination_reason'))
+env.close()
+PY
+```
+
+## 8.3 诊断 rollout
+
+```bash
+python scripts/diagnose_env_wntr_rollout.py --seed 42 --max-steps 24
+```
+
+## 8.4 r_benchmark 统计
+
+```bash
+python scripts/compute_r_benchmark.py --episodes 200 --seed 42 --net3-inp networks/Net3.inp --scaling-mode max_min --delta-time 0.3 --delta-space 0.3 --p-hydraulic -200 --progress
+```
+
+## 8.5 zscore 统计
+
+```bash
+python scripts/compute_zscore_stats.py --episodes 200 --seed 42 --net3-inp networks/Net3.inp --delta-time 0.3 --delta-space 0.3 --progress
+```
+
+## 8.6 PPO 冒烟训练
+
+```bash
+python scripts/train_ppo_net3.py --algo ppo --total-timesteps 2000 --seed 42 --net3-inp networks/Net3.inp --delta-time 0.1 --delta-space 0.1 --scaling-mode max_min --r-benchmark 406.54 --p-hydraulic -200 --device cpu
+```
+
+## 8.7 E-PPO 冒烟训练
+
+```bash
+python scripts/train_ppo_net3.py --algo eppo --sigma 0.2 --total-timesteps 2000 --seed 42 --net3-inp networks/Net3.inp --delta-time 0.1 --delta-space 0.1 --scaling-mode max_min --r-benchmark 406.54 --p-hydraulic -200 --device cpu
+```
+
+## 8.8 评估训练结果
+
+```bash
+python scripts/evaluate_policy_net3.py --help
+```
+
+---
+
+## 9. 整体测试与复现流程（推荐顺序）
+
+建议严格按以下顺序：
+
+1. 激活环境 + 依赖检查。
+2. 运行 `pytest -q` 建立回归基线。
+3. 做单步检查与诊断 rollout。
+4. 跑 `compute_r_benchmark.py` 了解当前基线。
+5. 跑 `compute_zscore_stats.py` 生成缩放统计。
+6. 先做 PPO 冒烟，再做 E-PPO 冒烟。
+7. 用 `evaluate_policy_net3.py` 对比两种算法。
+8. 再进入长程正式训练和论文结果对照。
+
+日志和结果查看路径：
+
+- 训练输出：`outputs/ppo_net3/run_*`
+- 统计 JSON：你在命令里指定的 `--output-json`
+- 运行日志：`logs/*.log`
+
+---
+
+## 10. 当前与论文仍可能有差异的点
+
+### 10.1 论文明确给出的，当前已对齐
+
+- 24 步、每步 1 小时语义。
+- 两泵 8 档，共 64 动作。
+- 违例大惩罚与提前终止。
+- PPO 关键超参数入口（network/lr/gamma/clip/epochs）。
+
+### 10.2 当前仓库已有实现，但仍需实验验证效果
+
+- `inp_modifier.py` 对 Net3 的规则、电价、效率改造流程。
+- `compute_r_benchmark.py` 多口径 benchmark 统计。
+- `evaluate_policy_net3.py` 奖励分解与 tank 末端状态审计。
+
+### 10.3 工程可运行近似（非论文源码逐行复刻）
+
+- E-PPO 在训练脚本中通过 SB3 `ent_coef` 映射实现。
+- critic `[256,128,1]` 在 SB3 表达为 `vf=[256,128] + 隐式 value head`。
+- `r_benchmark` 默认可直接传论文值 `406.54`，同时保留本地统计脚本结果作参考。
+
+### 10.4 为什么当前建议冻结 `env_wntr.py`
+
+你的主线目标已从“修环境”转到“做对照实验与复现流程”。
+
+- 训练阶段频繁改环境会破坏可复现性。
+- 先固定环境，再做 PPO/E-PPO 对照更稳。
+
+---
+
+## 11. 后续建议（按优先级）
+
+1. 固定一组训练配置，分别跑 PPO 与 E-PPO（`sigma=0.2`）。
+2. 用统一评估脚本在相同 seeds 下做对照。
+3. 汇总 reward / energy / tank 指标并与论文目标比对。
+4. 仅在“证据充分”时再回到环境细节微调。
+
+---
+
+## 12. 注释补充计划（不改逻辑）
+
+如果继续补中文注释，建议优先级：
+
+1. [env_wntr.py](/home/dengxu/projects/EPANET_RL/src/epanet_rl/env_wntr.py)：`step` 与 `_simulate_single_step` 的字段和失败分支。
+2. [train_ppo_net3.py](/home/dengxu/projects/EPANET_RL/scripts/train_ppo_net3.py)：分离学习率与 SB3 覆盖机制。
+3. [compute_r_benchmark.py](/home/dengxu/projects/EPANET_RL/scripts/compute_r_benchmark.py)：多口径统计定义。
+4. [evaluate_policy_net3.py](/home/dengxu/projects/EPANET_RL/scripts/evaluate_policy_net3.py)：成功子集与 tank 审计指标。
+5. [demand_randomization.py](/home/dengxu/projects/EPANET_RL/src/epanet_rl/demand_randomization.py)：两步随机化公式与 mask 语义。
+

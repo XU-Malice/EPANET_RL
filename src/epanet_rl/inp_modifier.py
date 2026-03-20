@@ -1,4 +1,14 @@
-"""Utilities for modifying EPANET INP files for the Net3 RL setup."""
+"""Net3 论文工况 INP 预处理工具。
+
+教学导读：
+1. 论文明确给出的：
+   - Net3 需要做特定工况改造（控制规则、Pipe330、电价、效率等）。
+2. 当前仓库实现：
+   - 以“文本处理”方式改写 INP 关键 section；
+   - 可通过单元测试直接审计输出，不依赖跑仿真后再回看。
+3. 工程细节：
+   - 处理顺序固定（控制→状态→能源→pattern），便于复核和 diff 对比。
+"""
 
 from __future__ import annotations
 
@@ -23,6 +33,8 @@ _DEMAND_CHARGE_RE = re.compile(r"^\s*Demand\s+Charge\b", re.IGNORECASE)
 
 
 def _find_section_bounds(lines: list[str], section_name: str) -> tuple[int, int]:
+    """定位某个 INP section 的起止行（包含头，不包含下一个 section 头）。"""
+
     target = section_name.strip().upper()
     for idx, line in enumerate(lines):
         match = _SECTION_RE.match(line)
@@ -40,6 +52,8 @@ def _find_section_bounds(lines: list[str], section_name: str) -> tuple[int, int]
 
 
 def _try_find_section_bounds(lines: list[str], section_name: str) -> tuple[int, int] | None:
+    """尝试定位 section，缺失时返回 None（而非抛错）。"""
+
     try:
         return _find_section_bounds(lines, section_name)
     except ValueError:
@@ -52,10 +66,14 @@ def _replace_section_body(
     section_end: int,
     new_body: list[str],
 ) -> list[str]:
+    """替换指定 section 的主体内容。"""
+
     return lines[: section_start + 1] + new_body + lines[section_end:]
 
 
 def _squeeze_blank_lines(lines: Iterable[str]) -> list[str]:
+    """压缩连续空行，避免生成的 INP 过多空白噪声。"""
+
     result: list[str] = []
     previous_blank = False
     for line in lines:
@@ -68,6 +86,8 @@ def _squeeze_blank_lines(lines: Iterable[str]) -> list[str]:
 
 
 def _is_related_control_line(line: str) -> bool:
+    """判断某条 CONTROLS/RULES 行是否属于目标删除对象。"""
+
     stripped = line.strip()
     if not stripped:
         return False
@@ -77,6 +97,8 @@ def _is_related_control_line(line: str) -> bool:
 
 
 def _remove_related_controls(lines: list[str]) -> list[str]:
+    """删除与 Link/Pump/Pipe 10/330/335 相关控制条目。"""
+
     for section_name in ("CONTROLS", "RULES"):
         bounds = _try_find_section_bounds(lines, section_name)
         if bounds is None:
@@ -89,6 +111,8 @@ def _remove_related_controls(lines: list[str]) -> list[str]:
 
 
 def _set_pipe_330_closed(lines: list[str]) -> list[str]:
+    """在 [STATUS] 中确保 Pipe 330 为 Closed（且只保留一条）。"""
+
     section_start, section_end = _find_section_bounds(lines, "STATUS")
     body = lines[section_start + 1 : section_end]
 
@@ -119,6 +143,8 @@ def _set_pipe_330_closed(lines: list[str]) -> list[str]:
 
 
 def _format_number(value: float, decimals: int = 10) -> str:
+    """格式化数字，尽量避免无意义尾零。"""
+
     rounded_int = round(value)
     if abs(value - rounded_int) < 1e-12:
         return str(int(rounded_int))
@@ -126,6 +152,8 @@ def _format_number(value: float, decimals: int = 10) -> str:
 
 
 def _set_energy_section(lines: list[str]) -> list[str]:
+    """重写 [ENERGY] 关键全局参数（效率/价格/pattern）。"""
+
     section_start, section_end = _find_section_bounds(lines, "ENERGY")
     body = lines[section_start + 1 : section_end]
 
@@ -148,6 +176,7 @@ def _set_energy_section(lines: list[str]) -> list[str]:
 
         preserved_lines.append(line)
 
+    # EPANET [ENERGY] 的 Global Efficiency 使用百分数（75 表示 0.75）。
     efficiency_percent = TARGET_PUMP_EFFICIENCY * 100.0
     energy_settings = [
         f" Global Efficiency\t{_format_number(efficiency_percent)}",
@@ -171,6 +200,8 @@ def _set_energy_section(lines: list[str]) -> list[str]:
 
 
 def _build_tou_pattern_values() -> list[str]:
+    """构造 24 小时 TOU 电价乘子。"""
+
     peak_ratio = PEAK_PRICE_USD_PER_KWH / OFFPEAK_PRICE_USD_PER_KWH
     values = []
     for hour in range(24):
@@ -182,6 +213,8 @@ def _build_tou_pattern_values() -> list[str]:
 
 
 def _upsert_tou_pattern(lines: list[str]) -> list[str]:
+    """在 [PATTERNS] 中插入或更新 TOU_PATTERN_ID。"""
+
     section_start, section_end = _find_section_bounds(lines, "PATTERNS")
     body = lines[section_start + 1 : section_end]
 
@@ -215,12 +248,20 @@ def _upsert_tou_pattern(lines: list[str]) -> list[str]:
 
 
 def modify_inp_text(inp_text: str) -> str:
-    """Return modified INP text matching the Net3 RL preprocessing targets."""
+    """将原始 INP 文本转换为 RL 预处理后的文本。
+
+    说明：
+    - 这是纯文本函数，不做磁盘 I/O；
+    - 适合在单测中直接做“输入文本 -> 输出文本”的断言；
+    - 环境初始化时也可以先在内存完成改写，再写入临时 INP 文件。
+    """
 
     newline = "\r\n" if "\r\n" in inp_text else "\n"
     had_trailing_newline = inp_text.endswith(("\r\n", "\n"))
     lines = inp_text.splitlines()
 
+    # 处理顺序有意固定，便于审计和单测：
+    # 1) 删除相关控制；2) Pipe330 常闭；3) 能源参数；4) TOU pattern。
     lines = _remove_related_controls(lines)
     lines = _set_pipe_330_closed(lines)
     lines = _set_energy_section(lines)
@@ -238,7 +279,7 @@ def modify_inp_file(
     *,
     in_place: bool = False,
 ) -> Path:
-    """Modify an INP file and return the output path."""
+    """修改 INP 文件并返回输出路径。"""
 
     input_file = Path(input_path)
     if in_place and output_path is not None:
@@ -258,6 +299,8 @@ def modify_inp_file(
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
+    """构造命令行参数。"""
+
     parser = argparse.ArgumentParser(description="Modify EPANET INP file for Net3 RL setup.")
     parser.add_argument("--input", type=Path, required=True, help="Input INP file path.")
     group = parser.add_mutually_exclusive_group()
@@ -267,6 +310,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """CLI 入口。"""
+
     args = _build_arg_parser().parse_args()
     output = modify_inp_file(args.input, args.output, in_place=args.in_place)
     print(f"Modified INP written to: {output}")

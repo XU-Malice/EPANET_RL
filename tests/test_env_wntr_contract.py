@@ -40,6 +40,38 @@ def test_tank_upper_bound_state_does_not_immediately_return_nan_outputs() -> Non
     env.close()
 
 
+def test_constructor_rejects_non_negative_hydraulic_penalty() -> None:
+    with pytest.raises(ValueError, match="p_hydraulic must be negative"):
+        Net3WntrEnv(net3_inp_path=_net3_path(), scaling_mode="none", p_hydraulic=0.0)
+
+
+def test_hydraulic_violation_terminates_with_penalty_and_reason() -> None:
+    env = Net3WntrEnv(net3_inp_path=_net3_path(), scaling_mode="none", p_hydraulic=-321.0)
+    env.reset(seed=42)
+
+    def fake_simulate_single_step(pump_speeds, current_demands, tank_init_levels):
+        _ = pump_speeds, current_demands
+        return {
+            "tank_levels": np.asarray(tank_init_levels, dtype=np.float64),
+            "hydraulic_violation": True,
+            "min_pressure": -1.0,
+            "pump_flows": np.asarray([0.0, 0.0], dtype=np.float64),
+            "pump_head_gains": np.asarray([0.0, 0.0], dtype=np.float64),
+            "pump_energy_cost": 123.0,
+        }
+
+    env._simulate_single_step = fake_simulate_single_step  # type: ignore[method-assign]  # noqa: SLF001
+    _, reward, terminated, truncated, info = env.step(63)
+
+    assert reward == pytest.approx(-321.0)
+    assert terminated is True
+    assert truncated is False
+    assert info["hydraulic_violation"] is True
+    assert info["termination_reason"] == "hydraulic_violation"
+
+    env.close()
+
+
 def test_tank_levels_passed_to_solver_are_below_max_by_epsilon() -> None:
     env = Net3WntrEnv(net3_inp_path=_net3_path(), scaling_mode="none", tank_level_epsilon=1e-4)
     env.reset(seed=1)
