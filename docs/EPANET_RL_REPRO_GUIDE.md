@@ -626,3 +626,184 @@ python scripts/evaluate_policy_net3.py --help
 4. [evaluate_policy_net3.py](/home/dengxu/projects/EPANET_RL/scripts/evaluate_policy_net3.py)：成功子集与 tank 审计指标。
 5. [demand_randomization.py](/home/dengxu/projects/EPANET_RL/src/epanet_rl/demand_randomization.py)：两步随机化公式与 mask 语义。
 
+
+
+## 批量复现实验
+
+### 为什么新增 suite 脚本
+
+当你已经确认单次 `train_ppo_net3.py` / `evaluate_policy_net3.py` 可以工作后，下一步通常不是“手工一条条命令反复敲”，而是系统化地做 PPO / E-PPO 对照实验。
+
+因此当前仓库增加了：
+
+- `scripts/run_reproduction_suite.py`
+
+它的定位是：
+
+- 只做**流程编排**，不改 `env_wntr.py` 主逻辑；
+- 自动按实验矩阵批量训练；
+- 每个训练完成后自动调用评估脚本；
+- 最后输出 suite 级别的 `summary_json / summary_csv`。
+
+### 论文明确给出的 / 当前仓库实现 / 工程优化
+
+这一节非常重要，建议你在写实验记录时直接照着这个口径整理。
+
+#### 论文明确给出的
+
+- 主线环境固定为 `Net3WntrEnv`
+- 24 步决策、每步 1 小时
+- PPO 可视为 `sigma=0`
+- E-PPO 对照重点是 `sigma=0.2`
+
+#### 当前仓库已有实现
+
+- `scripts/train_ppo_net3.py` 支持 `--algo ppo` 与 `--algo eppo`
+- 当前仓库中，`algo=ppo` 时即使传入非零 `sigma`，训练脚本也会忽略它，并把有效 entropy 系数视为 0
+- `scripts/evaluate_policy_net3.py` 会输出 `energy cost / reward / tank penalty / volume_change_ratio` 等评估指标
+
+#### 工程优化
+
+- 为避免无效重复实验，`scripts/run_reproduction_suite.py` 在构建实验矩阵时：
+  - `ppo` 只生成 `sigma=0`
+  - `eppo` 才展开用户传入的 `sigma` 列表
+- 这不会改变论文口径，反而能避免生成一堆“名义上 sigma 不同、实际上训练等价”的 `ppo` 重复实验
+
+### 如何运行批量 suite
+
+推荐服务器命令示例：
+
+```bash
+python scripts/run_reproduction_suite.py \
+  --algos ppo eppo \
+  --sigmas 0 0.2 0.3 \
+  --delta 0.3 \
+  --timesteps 100000 \
+  --seeds 1 2 3 \
+  --eval-episodes 20 \
+  --device cpu \
+  --output-dir outputs/reproduction_suite \
+  --force
+```
+
+如果你要切到 200000 步，只需要把：
+
+```bash
+--timesteps 100000
+```
+
+改成：
+
+```bash
+--timesteps 200000
+```
+
+### suite 会生成什么结果
+
+每次运行都会在你指定的 `--output-dir` 下再创建一个：
+
+- `suite_时间戳/`
+
+其中通常包含：
+
+- `suite_manifest.json`
+  - 记录这次 suite 打算跑哪些实验格子
+- `suite_summary.json`
+  - 结构化总汇总，适合后续程序读取
+- `suite_summary.csv`
+  - 表格化总汇总，适合直接用 pandas / Excel / LibreOffice 看
+- 每个实验一个独立目录
+  - 里面会有 `train.log`、`eval.log`、`experiment_meta.json`、`eval_summary.json` 等文件
+
+### 如何看 `summary_json / summary_csv`
+
+#### `suite_summary.json`
+
+更适合：
+
+- 写自动分析脚本
+- 做二次聚合
+- 保留“论文给定 / 仓库实现 / 工程近似”的元数据说明
+
+重点关注：
+
+- `suite_config`
+- `suite_stats`
+- `experiments[]`
+
+其中 `experiments[]` 里会保留每个实验的：
+
+- `algo`
+- `sigma`
+- `seed`
+- `status`
+- `mean_total_reward`
+- `mean_total_energy_cost`
+- `mean_total_tank_penalty`
+- `mean_volume_change_ratio`
+- `hydraulic_violation_rate`
+- `full_horizon_rate`
+- `successful_episode_rate`
+
+#### `suite_summary.csv`
+
+更适合：
+
+- 快速横向比较不同 seed / 不同 sigma
+- 直接画表
+- 先人工筛查哪些实验值得深入分析
+
+一个很实用的经验是：
+
+1. 先看 `mean_total_energy_cost`
+2. 再看 `mean_total_tank_penalty`
+3. 再看 `mean_volume_change_ratio`
+4. 最后结合 `successful_episode_rate` 判断是不是“靠透支 tank volume 换低能耗”
+
+### 如何断点续跑
+
+如果服务器训练到一半断了，不建议把整个输出目录删掉重来。
+
+你可以重新执行同类命令，并加上：
+
+```bash
+--skip-existing
+```
+
+它的语义是：
+
+- 如果某个实验目录下已经存在 `eval_summary.json`
+- suite 就直接读取已有结果，不再重复训练和评估
+
+这对多 seed、大时间步长实验非常有用。
+
+推荐断点续跑示例：
+
+```bash
+python scripts/run_reproduction_suite.py \
+  --algos ppo eppo \
+  --sigmas 0 0.2 0.3 \
+  --delta 0.3 \
+  --timesteps 200000 \
+  --seeds 1 2 3 \
+  --eval-episodes 20 \
+  --device cpu \
+  --output-dir outputs/reproduction_suite \
+  --force \
+  --skip-existing
+```
+
+### 使用建议
+
+如果你当前最关心的是“penalty form 和 PPO / E-PPO 对照”，建议优先这样组织实验：
+
+1. 先固定 `delta=0.3`
+2. 先跑 `ppo(sigma=0)` 与 `eppo(sigma=0.2)`
+3. 再补 `eppo(sigma=0.3)` 看熵增强是否进一步放大“省电但透支 tank”现象
+4. 优先同时看：
+   - `energy cost`
+   - `tank penalty`
+   - `volume_change_ratio`
+   - `successful_episode_rate`
+
+这样更容易把“真优化”与“投机策略”分开。
